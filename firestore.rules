@@ -1,0 +1,15 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /scores/{scoreId} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasAll(['name', 'score', 'mode', 'level'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() <= 18
+        && request.resource.data.score is int
+        && request.resource.data.score >= 0
+        && request.resource.data.level is int;
+      allow update, delete: if false;
+    }
+  }
+}
