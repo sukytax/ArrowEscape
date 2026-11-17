@@ -4,6 +4,170 @@ export const MODES = {
   Hard: { cols: 36, rows: 44, arrows: 200, stroke: 0.13, hints: 1, label: 'Hard', color: '#d05f5f' },
 };
 
+export const SHAPES_CATALOG = [
+  { id: 'rectangle', nameId: 'Persegi', nameEn: 'Rectangle' },
+  { id: 'cross', nameId: 'Salib (+)', nameEn: 'Cross' },
+  { id: 'diamond', nameId: 'Berlian', nameEn: 'Diamond' },
+  { id: 'hourglass', nameId: 'Jam Pasir', nameEn: 'Hourglass' },
+  { id: 'shield', nameId: 'Perisai', nameEn: 'Shield' },
+  { id: 'pyramid', nameId: 'Piramida', nameEn: 'Pyramid' },
+  { id: 'star', nameId: 'Bintang', nameEn: 'Star' },
+  { id: 't_shape', nameId: 'Bentuk T', nameEn: 'T-Shape' },
+  { id: 'staircase', nameId: 'Tangga Zigzag', nameEn: 'Staircase' },
+  { id: 'hexagon', nameId: 'Heksagon', nameEn: 'Hexagon' },
+];
+
+export function getBoardShapeInfo(level) {
+  if (!level || level <= 1) return SHAPES_CATALOG[0];
+  const idx = 1 + ((level - 2) % (SHAPES_CATALOG.length - 1));
+  return SHAPES_CATALOG[idx];
+}
+
+export function isCellInShape(x, y, cols, rows, shapeId) {
+  if (shapeId === 'rectangle' || !shapeId) return true;
+  const cx = (cols - 1) / 2;
+  const cy = (rows - 1) / 2;
+  const nx = (x - cx) / Math.max(1, cx);
+  const ny = (y - cy) / Math.max(1, cy);
+  const u = Math.abs(nx);
+  const v = Math.abs(ny);
+
+  switch (shapeId) {
+    case 'cross': {
+      // Greek cross: cut out 4 corner rectangles
+      return !(u > 0.52 && v > 0.52);
+    }
+    case 'diamond': {
+      // Chamfered 4 corners (faceted octagon / diamond)
+      return (u + v) <= 1.34;
+    }
+    case 'hourglass': {
+      // Pinched horizontal waist
+      const maxU = 0.52 + 0.48 * (v * v);
+      return u <= maxU;
+    }
+    case 'shield': {
+      // Rounded oval / barrel shape
+      return (u * u + v * v) <= 1.15;
+    }
+    case 'pyramid': {
+      // Stepped pyramid: narrower at top (ny < -0.3), wider at bottom
+      const maxW = ny < -0.3 ? 0.55 : (ny < 0.3 ? 0.8 : 1.0);
+      return u <= maxW;
+    }
+    case 'star': {
+      // 8-notched star: cut outer corner blocks
+      return !(u > 0.65 && v > 0.65);
+    }
+    case 't_shape': {
+      // T-shape: wide bar at top, centered stem at bottom
+      if (ny <= -0.15) return true;
+      return u <= 0.48;
+    }
+    case 'staircase': {
+      // Diagonal stepped / staircase mask
+      return Math.abs(nx - ny * 0.7) <= 1.15;
+    }
+    case 'hexagon': {
+      // Vertical hexagon: top and bottom tapered
+      return (u * 0.5 + v) <= 1.25 && u <= 1.0;
+    }
+    default:
+      return true;
+  }
+}
+
+export function getBoundaryPath(cols, rows, shapeId) {
+  const edges = new Map();
+  function addEdge(x1, y1, x2, y2) {
+    const key = `${x1},${y1}->${x2},${y2}`;
+    edges.set(key, { from: [x1, y1], to: [x2, y2] });
+  }
+
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (!isCellInShape(x, y, cols, rows, shapeId)) continue;
+      if (y === 0 || !isCellInShape(x, y - 1, cols, rows, shapeId)) {
+        addEdge(x - 0.5, y - 0.5, x + 0.5, y - 0.5);
+      }
+      if (x === cols - 1 || !isCellInShape(x + 1, y, cols, rows, shapeId)) {
+        addEdge(x + 0.5, y - 0.5, x + 0.5, y + 0.5);
+      }
+      if (y === rows - 1 || !isCellInShape(x, y + 1, cols, rows, shapeId)) {
+        addEdge(x + 0.5, y + 0.5, x - 0.5, y + 0.5);
+      }
+      if (x === 0 || !isCellInShape(x - 1, y, cols, rows, shapeId)) {
+        addEdge(x - 0.5, y + 0.5, x - 0.5, y - 0.5);
+      }
+    }
+  }
+
+  const adj = new Map();
+  for (const { from, to } of edges.values()) {
+    const kFrom = `${from[0]},${from[1]}`;
+    if (!adj.has(kFrom)) adj.set(kFrom, []);
+    adj.get(kFrom).push(to);
+  }
+
+  const visited = new Set();
+  const paths = [];
+
+  for (const [startKey, targets] of adj.entries()) {
+    for (const target of targets) {
+      const edgeKey = `${startKey}->${target[0]},${target[1]}`;
+      if (visited.has(edgeKey)) continue;
+
+      const loop = [];
+      let currPt = startKey.split(',').map(Number);
+      loop.push(currPt);
+
+      let nextPt = target;
+      visited.add(edgeKey);
+
+      while (nextPt) {
+        loop.push(nextPt);
+        const currKey = `${nextPt[0]},${nextPt[1]}`;
+        const nextTargets = adj.get(currKey) || [];
+        let chosen = null;
+        for (const t of nextTargets) {
+          const ek = `${currKey}->${t[0]},${t[1]}`;
+          if (!visited.has(ek)) {
+            visited.add(ek);
+            chosen = t;
+            break;
+          }
+        }
+        nextPt = chosen;
+      }
+
+      if (loop.length > 2) {
+        const simp = [loop[0]];
+        for (let i = 1; i < loop.length - 1; i++) {
+          const prev = simp[simp.length - 1];
+          const curr = loop[i];
+          const next = loop[i + 1];
+          const dx1 = curr[0] - prev[0];
+          const dy1 = curr[1] - prev[1];
+          const dx2 = next[0] - curr[0];
+          const dy2 = next[1] - curr[1];
+          if ((dx1 === 0 && dx2 === 0) || (dy1 === 0 && dy2 === 0)) continue;
+          simp.push(curr);
+        }
+        simp.push(loop[loop.length - 1]);
+
+        let d = `M ${simp[0][0]} ${simp[0][1]}`;
+        for (let i = 1; i < simp.length; i++) {
+          d += ` L ${simp[i][0]} ${simp[i][1]}`;
+        }
+        d += ' Z';
+        paths.push(d);
+      }
+    }
+  }
+
+  return paths.join(' ');
+}
+
 const DIRS = [
   { name: 'right', dx: 1, dy: 0 },
   { name: 'left', dx: -1, dy: 0 },
@@ -156,17 +320,21 @@ function isTurnClockwise(fromDir, toDir) {
   return false;
 }
 
-function generateMaze(cols, rows, seed, level) {
+function generateMaze(cols, rows, seed, shapeId = 'rectangle') {
   const rng = mulberry32(seed);
   const total = cols * rows;
   const owner = new Int32Array(total).fill(-1);
   const paths = [];
 
+  function inShape(x, y) {
+    return isCellInShape(x, y, cols, rows, shapeId);
+  }
+
   function countFreeNeighbors(x, y) {
     let c = 0;
     for (const d of DIRS) {
       const nx = x + d.dx, ny = y + d.dy;
-      if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && owner[ny * cols + nx] === -1) c++;
+      if (nx >= 0 && nx < cols && ny >= 0 && ny < rows && inShape(nx, ny) && owner[ny * cols + nx] === -1) c++;
     }
     return c;
   }
@@ -176,6 +344,7 @@ function generateMaze(cols, rows, seed, level) {
     let best = [];
     for (let y = 0; y < rows; y++) {
       for (let x = 0; x < cols; x++) {
+        if (!inShape(x, y)) continue;
         if (owner[y * cols + x] !== -1) continue;
         const deg = countFreeNeighbors(x, y);
         if (deg === 0) continue;
@@ -236,6 +405,7 @@ function generateMaze(cols, rows, seed, level) {
       for (const d of DIRS) {
         const nx = cx + d.dx, ny = cy + d.dy;
         if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
+        if (!inShape(nx, ny)) continue;
         if (owner[ny * cols + nx] !== -1) continue;
         const deg = countFreeNeighbors(nx, ny);
         let score = (4 - deg) * 2.2;
@@ -286,10 +456,12 @@ function generateMaze(cols, rows, seed, level) {
   // Absorb isolated 1-cell spots into an adjacent path endpoint
   for (let y = 0; y < rows; y++) {
     for (let x = 0; x < cols; x++) {
+      if (!inShape(x, y)) continue;
       if (owner[y * cols + x] !== -1) continue;
       for (const d of DIRS) {
         const nx = x + d.dx, ny = y + d.dy;
         if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
+        if (!inShape(nx, ny)) continue;
         const pid = owner[ny * cols + nx];
         if (pid === -1) continue;
         const p = paths[pid];
@@ -401,6 +573,7 @@ function generateMaze(cols, rows, seed, level) {
       for (const d of DIRS) {
         const nx = rx + d.dx, ny = ry + d.dy;
         if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
+        if (!inShape(nx, ny)) continue;
         const nid = owner[ny * cols + nx];
         if (nid !== -1 && remaining.has(nid)) {
           const np = remaining.get(nid);
@@ -422,15 +595,29 @@ function generateMaze(cols, rows, seed, level) {
   return finalArrows;
 }
 
-export function makeBoard(mode, level, customSeed) {
+export function makeBoard(mode, level = 1, customSeed) {
   const cfg = MODES[mode];
+  const shapeInfo = getBoardShapeInfo(level);
   const randomSalt = customSeed ?? ((Math.random() * 0x7fffffff) | 0);
   const baseSeed = (1337 + level * 977 + mode.length * 131 + randomSalt) >>> 0;
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const board = generateMaze(cfg.cols, cfg.rows, (baseSeed + attempt * 7919) >>> 0, level);
-    if (board && board.length >= 6 && !hasCrossing(board) && solveCount(board) === board.length) {
+
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const board = generateMaze(cfg.cols, cfg.rows, (baseSeed + attempt * 7919) >>> 0, shapeInfo.id);
+    if (board && board.length >= 4 && !hasCrossing(board) && solveCount(board) === board.length) {
+      board.shape = shapeInfo.id;
+      board.shapeName = shapeInfo.nameId;
+      board.level = level;
       return board;
     }
+  }
+
+  // Safe fallback to default rectangle
+  const fallback = generateMaze(cfg.cols, cfg.rows, baseSeed, 'rectangle');
+  if (fallback) {
+    fallback.shape = 'rectangle';
+    fallback.shapeName = 'Persegi';
+    fallback.level = level;
+    return fallback;
   }
   return [];
 }

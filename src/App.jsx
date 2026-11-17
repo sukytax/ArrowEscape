@@ -6,7 +6,7 @@ import {
   ZoomIn, ZoomOut,
 } from 'lucide-react';
 import { db } from './firebase';
-import { MODES, VEC, hitDistance, isClear, makeBoard } from './game';
+import { MODES, VEC, hitDistance, isClear, makeBoard, getBoardShapeInfo, getBoundaryPath } from './game';
 import logoImg from './assets/logo.png';
 
 // ─── sound ────────────────────────────────────────────────────────────────────
@@ -28,7 +28,7 @@ function playTone(freq, dur, type = 'sine', vol = 0.05) {
 }
 
 // ─── snake path helpers ───────────────────────────────────────────────────────
-const VIEW_PAD = 0.72;
+const VIEW_PAD = 1.05;
 
 function buildTrack(pts, dir, cols, rows) {
   const [dx, dy] = VEC[dir];
@@ -139,22 +139,47 @@ const StaticArrow = memo(function StaticArrow({ arrow, sw, isHint, interactive, 
   const headBase = -strokeW * 1.45;
   const headTip = strokeW * 0.75;
   const headHalfW = strokeW * 1.55;
+  const tail = arrow.pts[0];
+  const hitWidth = Math.max(0.88, strokeW * 4.5);
 
   return (
     <g
       className={isHint ? 'arrow-hint' : ''}
-      onClick={interactive ? () => onTap(arrow) : undefined}
+      onClick={interactive ? (e) => { e.stopPropagation(); onTap(arrow); } : undefined}
       style={{ cursor: interactive ? 'pointer' : 'default' }}
     >
       {interactive && (
-        <polyline
-          points={hitPts}
-          fill="none"
-          stroke="transparent"
-          strokeWidth={0.85}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
+        <g className="arrow-hit-targets">
+          {/* Broad hit strip covering entire body, corners, and joints */}
+          <polyline
+            points={hitPts}
+            fill="none"
+            stroke="#000"
+            strokeOpacity="0.001"
+            strokeWidth={hitWidth}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
+          />
+          {/* Explicit tail (belakang / ekor panah) hit circle */}
+          <circle
+            cx={tail[0]}
+            cy={tail[1]}
+            r={hitWidth * 0.52}
+            fill="#000"
+            fillOpacity="0.001"
+            style={{ pointerEvents: 'all', cursor: 'pointer' }}
+          />
+          {/* Explicit head (ujung kepala panah) hit circle */}
+          <circle
+            cx={tip[0]}
+            cy={tip[1]}
+            r={hitWidth * 0.55}
+            fill="#000"
+            fillOpacity="0.001"
+            style={{ pointerEvents: 'all', cursor: 'pointer' }}
+          />
+        </g>
       )}
       <polyline
         points={bodyPts}
@@ -163,11 +188,13 @@ const StaticArrow = memo(function StaticArrow({ arrow, sw, isHint, interactive, 
         strokeWidth={strokeW}
         strokeLinecap="butt"
         strokeLinejoin="miter"
+        style={{ pointerEvents: interactive ? 'stroke' : 'none' }}
       />
       <polygon
         points={`${headBase},${-headHalfW} ${headTip},0 ${headBase},${headHalfW}`}
         fill={color}
         transform={`translate(${tip[0]} ${tip[1]}) rotate(${angle})`}
+        style={{ pointerEvents: interactive ? 'all' : 'none' }}
       />
     </g>
   );
@@ -395,11 +422,13 @@ function ExitingArrow({ arrow, cols, rows, sw, onDone }) {
   );
 }
 
-function BoardSVG({ arrows, mode, onTap, onExitDone, onBumpDone, hintId, bumping, interactive = false }) {
+function BoardSVG({ arrows, mode, onTap, onExitDone, onBumpDone, hintId, bumping, interactive = false, shape }) {
   const cfg = MODES[mode];
   const cols = cfg.cols;
   const rows = cfg.rows;
   const sw = cfg.stroke;
+  const activeShape = shape || arrows?.shape || 'rectangle';
+  const boundaryPath = useMemo(() => getBoundaryPath(cols, rows, activeShape), [cols, rows, activeShape]);
 
   return (
     <svg
@@ -407,6 +436,15 @@ function BoardSVG({ arrows, mode, onTap, onExitDone, onBumpDone, hintId, bumping
       preserveAspectRatio="xMidYMid meet"
       className="board-svg"
     >
+      {/* Board shape silhouette plate */}
+      {boundaryPath && (
+        <path
+          className="board-plate"
+          d={boundaryPath}
+          strokeWidth={sw * 1.05}
+        />
+      )}
+
       {/* Static grid dots appear only at coordinates of arrows that have been cleared */}
       {arrows.map(a => (a.removed ? <VacatedDots key={`dots-${a.id}`} pts={a.pts} sw={sw} /> : null))}
 
@@ -540,15 +578,24 @@ export default function App() {
   const bumpSeqRef = useRef(0);
   const levelBaseScoreRef = useRef(0);
   const gameOverTimerRef = useRef(null);
+  const currentShapeInfo = useMemo(() => getBoardShapeInfo(level), [level]);
+  const nextShapeInfo = useMemo(() => getBoardShapeInfo(level + 1), [level]);
 
-  // ─── zoom & pan ────────────────────────────────────────────────────────────
+  // ─── zoom & pan (smooth pinch / squeeze + drag + wheel) ─────────────────────
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
+  const [isPinching, setIsPinching] = useState(false);
+
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const panRef = useRef(pan);
+  panRef.current = pan;
+
   const dragStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+  const pinchRef = useRef(null);
   const didPanRef = useRef(false);
-  const pinchStartDistRef = useRef(null);
-  const pinchStartZoomRef = useRef(1);
+  const didPanTimerRef = useRef(null);
   const stageRef = useRef(null);
 
   const clampPan = useCallback((x, y, currentZoom) => {
@@ -556,8 +603,9 @@ export default function App() {
     const stage = stageRef.current;
     const w = stage ? stage.clientWidth : 400;
     const h = stage ? stage.clientHeight : 500;
-    const maxPanX = (w * (currentZoom - 1)) / 2 + 50;
-    const maxPanY = (h * (currentZoom - 1)) / 2 + 50;
+    // Generous pan limits so any edge or corner can be scrolled comfortably into clear view
+    const maxPanX = ((w * currentZoom) - w) / 2 + (w * 0.35);
+    const maxPanY = ((h * currentZoom) - h) / 2 + (h * 0.35);
     return {
       x: Math.max(-maxPanX, Math.min(maxPanX, x)),
       y: Math.max(-maxPanY, Math.min(maxPanY, y)),
@@ -566,7 +614,7 @@ export default function App() {
 
   const handleZoomIn = useCallback(() => {
     setZoom(z => {
-      const next = Math.min(3.0, Math.round((z + 0.35) * 100) / 100);
+      const next = Math.min(3.5, Math.round((z + 0.35) * 100) / 100);
       setPan(p => clampPan(p.x, p.y, next));
       return next;
     });
@@ -590,17 +638,17 @@ export default function App() {
   }, []);
 
   const onMouseDownStage = useCallback((e) => {
-    if (zoom <= 1.01) return;
+    if (zoomRef.current <= 1.01) return;
     if (e.button !== 0) return;
     setIsDragging(true);
     didPanRef.current = false;
     dragStartRef.current = {
       x: e.clientX,
       y: e.clientY,
-      panX: pan.x,
-      panY: pan.y,
+      panX: panRef.current.x,
+      panY: panRef.current.y,
     };
-  }, [zoom, pan]);
+  }, []);
 
   useEffect(() => {
     if (!isDragging) return;
@@ -611,7 +659,7 @@ export default function App() {
       if (Math.hypot(dx, dy) > 5) {
         didPanRef.current = true;
       }
-      setPan(clampPan(dragStartRef.current.panX + dx, dragStartRef.current.panY + dy, zoom));
+      setPan(clampPan(dragStartRef.current.panX + dx, dragStartRef.current.panY + dy, zoomRef.current));
     };
 
     const onMouseUp = () => {
@@ -627,61 +675,117 @@ export default function App() {
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [isDragging, zoom, clampPan]);
+  }, [isDragging, clampPan]);
 
-  const onTouchStartStage = useCallback((e) => {
-    if (e.touches.length === 2) {
-      const d = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      );
-      pinchStartDistRef.current = d;
-      pinchStartZoomRef.current = zoom;
-      didPanRef.current = true;
-      setIsDragging(false);
-    } else if (e.touches.length === 1 && zoom > 1.01) {
-      const t = e.touches[0];
-      didPanRef.current = false;
-      setIsDragging(true);
-      dragStartRef.current = {
-        x: t.clientX,
-        y: t.clientY,
-        panX: pan.x,
-        panY: pan.y,
-      };
-    }
-  }, [zoom, pan]);
+  // Native non-passive touch listeners for 1:1 pinch / squeeze and pan
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
 
-  const onTouchMoveStage = useCallback((e) => {
-    if (e.touches.length === 2 && pinchStartDistRef.current) {
-      e.preventDefault();
-      const d = Math.hypot(
-        e.touches[0].clientX - e.touches[1].clientX,
-        e.touches[0].clientY - e.touches[1].clientY
-      );
-      const ratio = d / pinchStartDistRef.current;
-      const next = Math.min(3.0, Math.max(1.0, pinchStartZoomRef.current * ratio));
-      setZoom(next);
-      setPan(p => clampPan(p.x, p.y, next));
-      didPanRef.current = true;
-    } else if (e.touches.length === 1 && isDragging && zoom > 1.01) {
-      const t = e.touches[0];
-      const dx = t.clientX - dragStartRef.current.x;
-      const dy = t.clientY - dragStartRef.current.y;
-      if (Math.hypot(dx, dy) > 6) {
+    const onTouchStart = (e) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const d = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+        const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        pinchRef.current = {
+          startDist: d,
+          startZoom: zoomRef.current,
+          startPan: { ...panRef.current },
+          startMid: { x: midX, y: midY },
+        };
+        setIsPinching(true);
+        setIsDragging(false);
         didPanRef.current = true;
+        if (didPanTimerRef.current) clearTimeout(didPanTimerRef.current);
+      } else if (e.touches.length === 1 && zoomRef.current > 1.01) {
+        const t = e.touches[0];
+        setIsDragging(true);
+        setIsPinching(false);
+        dragStartRef.current = {
+          x: t.clientX,
+          y: t.clientY,
+          panX: panRef.current.x,
+          panY: panRef.current.y,
+        };
       }
-      setPan(clampPan(dragStartRef.current.panX + dx, dragStartRef.current.panY + dy, zoom));
-    }
-  }, [isDragging, zoom, clampPan]);
+    };
 
-  const onTouchEndStage = useCallback(() => {
-    pinchStartDistRef.current = null;
-    setIsDragging(false);
-    setTimeout(() => {
-      didPanRef.current = false;
-    }, 60);
-  }, []);
+    const onTouchMove = (e) => {
+      if (e.touches.length === 2 && pinchRef.current) {
+        e.preventDefault();
+        const d = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+        const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+
+        const { startDist, startZoom, startPan, startMid } = pinchRef.current;
+        if (startDist > 0) {
+          const ratio = d / startDist;
+          // Smooth squeeze (pinch in = zoom out) & spread (pinch out = zoom in)
+          const nextZoom = Math.min(3.5, Math.max(1.0, Math.round(startZoom * ratio * 100) / 100));
+          const dx = midX - startMid.x;
+          const dy = midY - startMid.y;
+          const nextPan = nextZoom <= 1.01
+            ? { x: 0, y: 0 }
+            : clampPan(startPan.x + dx, startPan.y + dy, nextZoom);
+
+          setZoom(nextZoom);
+          setPan(nextPan);
+          didPanRef.current = true;
+        }
+      } else if (e.touches.length === 1 && dragStartRef.current && zoomRef.current > 1.01) {
+        const t = e.touches[0];
+        const dx = t.clientX - dragStartRef.current.x;
+        const dy = t.clientY - dragStartRef.current.y;
+        if (Math.hypot(dx, dy) > 6) {
+          didPanRef.current = true;
+        }
+        setPan(clampPan(dragStartRef.current.panX + dx, dragStartRef.current.panY + dy, zoomRef.current));
+      }
+    };
+
+    const onTouchEnd = (e) => {
+      if (e.touches.length < 2 && pinchRef.current) {
+        pinchRef.current = null;
+        setIsPinching(false);
+        if (zoomRef.current <= 1.05) {
+          setZoom(1.0);
+          setPan({ x: 0, y: 0 });
+        }
+        didPanRef.current = true;
+        if (didPanTimerRef.current) clearTimeout(didPanTimerRef.current);
+        didPanTimerRef.current = setTimeout(() => {
+          didPanRef.current = false;
+        }, 280);
+      }
+      if (e.touches.length === 0) {
+        setIsDragging(false);
+        if (didPanTimerRef.current) clearTimeout(didPanTimerRef.current);
+        didPanTimerRef.current = setTimeout(() => {
+          didPanRef.current = false;
+        }, 200);
+      }
+    };
+
+    stage.addEventListener('touchstart', onTouchStart, { passive: false });
+    stage.addEventListener('touchmove', onTouchMove, { passive: false });
+    stage.addEventListener('touchend', onTouchEnd, { passive: true });
+    stage.addEventListener('touchcancel', onTouchEnd, { passive: true });
+
+    return () => {
+      stage.removeEventListener('touchstart', onTouchStart);
+      stage.removeEventListener('touchmove', onTouchMove);
+      stage.removeEventListener('touchend', onTouchEnd);
+      stage.removeEventListener('touchcancel', onTouchEnd);
+      if (didPanTimerRef.current) clearTimeout(didPanTimerRef.current);
+    };
+  }, [clampPan, screen]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -690,7 +794,7 @@ export default function App() {
       e.preventDefault();
       const delta = e.deltaY < 0 ? 0.25 : -0.25;
       setZoom(z => {
-        const next = Math.min(3.0, Math.max(1.0, Math.round((z + delta) * 100) / 100));
+        const next = Math.min(3.5, Math.max(1.0, Math.round((z + delta) * 100) / 100));
         if (next <= 1.01) {
           setPan({ x: 0, y: 0 });
           return 1.0;
@@ -906,7 +1010,7 @@ export default function App() {
   const demoBumpSeqRef = useRef(0);
 
   const resetDemo = useCallback(() => {
-    setDemoArrows(makeBoard('Easy', Math.floor(Math.random() * 20) + 1));
+    setDemoArrows(makeBoard('Easy', Math.floor(Math.random() * 10) + 1));
     setDemoBumping({});
   }, []);
 
@@ -1054,7 +1158,9 @@ export default function App() {
               <div className="preview-header">
                 <div className="preview-status">
                   <span className="live-pulse"></span>
-                  <span className="preview-tag">Demo Interaktif</span>
+                  <span className="preview-tag">
+                    Demo Interaktif · {demoArrows?.shapeName || 'Persegi'}
+                  </span>
                 </div>
                 <button className="preview-refresh-btn" onClick={resetDemo} title="Ganti papan contoh">
                   <Shuffle size={13} /> <span>Acak</span>
@@ -1150,7 +1256,7 @@ export default function App() {
                   <ChevronLeft size={24} strokeWidth={3} />
                 </button>
                 <div className="game-title">
-                  <span className="pill">{cfg.label}</span>
+                  <span className="pill">{cfg.label} · {currentShapeInfo.nameId}</span>
                   <h1>Level {level}</h1>
                 </div>
                 <button className="circle-btn dark" onClick={() => startGame(mode, level, levelBaseScoreRef.current)} aria-label="Ulangi">
@@ -1173,25 +1279,25 @@ export default function App() {
           </div>
 
           <div
-            className="board-stage"
+            className={`board-stage ${zoom > 1.05 ? 'is-zoomed' : ''}`}
             ref={stageRef}
             onMouseDown={onMouseDownStage}
-            onTouchStart={onTouchStartStage}
-            onTouchMove={onTouchMoveStage}
-            onTouchEnd={onTouchEndStage}
           >
             <div
               className="board-shell"
               style={{
                 transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
                 transformOrigin: 'center center',
-                transition: isDragging ? 'none' : 'transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1)',
+                transition: (isDragging || isPinching)
+                  ? 'none'
+                  : 'transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1)',
                 cursor: zoom > 1.01 ? (isDragging ? 'grabbing' : 'grab') : 'default',
               }}
             >
               <BoardSVG
                 arrows={arrows}
                 mode={mode}
+                shape={arrows?.shape || currentShapeInfo.id}
                 onTap={tapArrow}
                 onExitDone={handleExitDone}
                 onBumpDone={handleBumpDone}
@@ -1218,10 +1324,10 @@ export default function App() {
                 type="button"
                 className={`zoom-indicator ${zoom > 1.05 ? 'active' : ''}`}
                 onClick={handleZoomReset}
-                title={zoom > 1.05 ? 'Reset ke 100%' : 'Ukuran Pas'}
+                title={zoom > 1.05 ? 'Klik untuk reset ke 100%' : 'Ukuran Pas (100%)'}
                 aria-label="Reset Zoom"
               >
-                {Math.round(zoom * 100)}%
+                {Math.round(zoom * 100)}%{zoom > 1.05 ? ' · Reset' : ''}
               </button>
               <button
                 type="button"
@@ -1289,9 +1395,9 @@ export default function App() {
               <X size={16} />
             </button>
             <div className="result-icon"><Check size={26} /></div>
-            <div className="eyebrow centered">LEVEL {level} SELESAI</div>
+            <div className="eyebrow centered">LEVEL {level} SELESAI · {currentShapeInfo.nameId.toUpperCase()}</div>
             <h2>Hebat sekali!</h2>
-            <p>Semua panah berhasil kamu keluarkan.</p>
+            <p>Semua panah berhasil kamu keluarkan dari papan {currentShapeInfo.nameId}.</p>
             <div className="result-score">
               <span>Total skor</span>
               <strong>{score}</strong>
@@ -1317,7 +1423,7 @@ export default function App() {
                 className="primary-button full"
                 onClick={() => finishAnd(() => startGame(mode, level + 1, score))}
               >
-                Lanjut Level {level + 1} <ArrowRight size={15} />
+                Lanjut Level {level + 1} ({nextShapeInfo.nameId}) <ArrowRight size={15} />
               </button>
               <button
                 className="secondary-button full"
